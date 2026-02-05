@@ -1,197 +1,678 @@
+# pyqt6_node_folder_rms_gui.py
+# PyQt6 conversion of your Tkinter UI + RMS-to-CSV pipeline.
+#
+# Requires: PyQt6
+#
+# Usage:
+#   python pyqt6_node_folder_rms_gui.py
+#
+# Notes:
+# - Left panel: Nodes (single-select)
+# - Right panel: Folders (multi-select)
+# - Bottom: base dir + processed dir with Browse...
+# - Top: numeric parameter entries (defaults as requested)
+# - "Run RMS -> CSV" computes total RMS per WAV and writes CSV to processed_dir
+
 import os
-import tkinter as tk
-from tkinter import ttk, messagebox
+import csv
+import wave
+import math
+import datetime
+import numpy as np
+from scipy.io import wavfile
+import sys
+from array import array
+from typing import Optional, Dict, List, Any
+
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QDoubleValidator
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QSplitter, QGroupBox, QFormLayout, QLabel, QLineEdit, QPushButton,
+    QListWidget, QListWidgetItem, QFileDialog, QMessageBox, QProgressBar,
+    QTextEdit
+)
 
 
-import os
-import tkinter as tk
-from tkinter import ttk, messagebox
+# ---------------- RMS helpers ----------------
+def _wav_total_rms(wav_path: str, chunk_frames: int = 65536) -> float:
+    """
+    Compute RMS over the entire WAV file (across all channels) as a single value.
+    Returns RMS in the sample's native integer scale.
+    Supports sample widths: 8-bit PCM, 16-bit PCM, 32-bit PCM.
+    """
+    with wave.open(wav_path, "rb") as wf:
+        sampwidth = wf.getsampwidth()
+        n_frames = wf.getnframes()
+
+        if sampwidth == 1:
+            typecode = "B"  # unsigned 8-bit
+            bias = 128
+        elif sampwidth == 2:
+            typecode = "h"  # signed 16-bit
+            bias = 0
+        elif sampwidth == 4:
+            typecode = "i"  # signed 32-bit
+            bias = 0
+        else:
+            raise ValueError(f"Unsupported WAV sample width: {sampwidth * 8} bits ({wav_path})")
+
+        sumsq = 0.0
+        count = 0
+
+        frames_left = n_frames
+        while frames_left > 0:
+            to_read = min(chunk_frames, frames_left)
+            frames_left -= to_read
+
+            data = wf.readframes(to_read)
+            if not data:
+                break
+
+            samples = array(typecode)
+            samples.frombytes(data)
+
+            if sampwidth == 1:
+                for s in samples:
+                    v = float(s - bias)
+                    sumsq += v * v
+            else:
+                for s in samples:
+                    v = float(s)
+                    sumsq += v * v
+
+            count += len(samples)
+
+        if count == 0:
+            return 0.0
+
+        return math.sqrt(sumsq / count)
+
+# def _psd(wav_path: str):
+#     fs, y = wavfile.read(wav_path)  # read in audio file
+#     y = y - np.mean(y)  # remove DC offset
+#     dt = 1 / fs
+#     timeSeries1 = np.array(timeSeries1)
+#     N = np.size(timeSeries1)
+#     T = N * dt
+#     nFFT = 2 ** int(np.ceil(np.log2(N)))
+#     freqs = np.arange(0, nFFT / 2)
+#
+#     if window == 'rectangular':
+#         w = np.ones(nFFT)
+#     elif window == 'hann':
+#         w = np.hanning(nFFT)
+#     elif window == 'flattop':
+#         w = sp.signal.windows.flattop(nFFT)
+#     elif window == 'hamming':
+#         w = np.hamming(nFFT)
+#     else:
+#         raise ValueError("No window function defined.")
+#
+#     GxyTemp = []
+#     for wIndex in np.arange(0, nWins):
+#         # print(f'Processing {wIndex} of {nWins}')
+#         advInx = wIndex * nAdv
+#         sig1 = timeSeries1[advInx:nFFT + advInx] * w / np.mean(w ** 2)  # may need a ,0 in the indexing for ice2024 data
+#         sig2 = timeSeries2[advInx:nFFT + advInx] * w / np.mean(w ** 2)
+#         lnspc1 = np.fft.fft(sig1, axis=0) * dt
+#         if type == 'gxx':
+#             lnspc2 = lnspc1
+#         elif type == 'gxy':
+#             lnspc2 = np.fft.fft(sig2, axis=0) * dt
+#         GxyTemp.append(2 / T_win * np.conjugate(lnspc1[0:int(nFFT / 2)]) * lnspc2[0:int(nFFT / 2)])
+#     Gxy_avg = np.sum(GxyTemp, axis=0) / nWins
+#     Gxy_mtx = np.rot90(GxyTemp)
+#     return_dict = {'Gxy_avg': Gxy_avg, 'Gxy_mtx': Gxy_mtx, 'freqs': freqs, 'times_spec': times_spec, 'df_win': df_win}
+#     return return_dict
 
 
-def node_folder_two_panel_selector(
-    local_node_list,
-    local_base_path,
-    audioFile="audio.wav",
-    dataFile="data.json",
-    title="Select Node, Folders, and Parameters",
-):
+def process_selected_node_rms_to_csv(selector_result: dict, csv_filename: Optional[str] = None) -> str:
+    """
+    Processes WAV files for the selected node + folders, computes total RMS per file,
+    and writes a CSV into selector_result["processed_dir"].
+    Returns: full path to the CSV written.
+    """
+    node = selector_result.get("selected_node")
+    folders = selector_result.get("selected_folders") or []
+    wav_paths = selector_result.get("dateWavPaths") or []
+    processed_dir = selector_result.get("processed_dir")
 
-    out = {
-        "selected_node": None,
-        "selected_folders": [],
-        "dateWavPaths": [],
-        "dateJsonPaths": [],
-        "mainDir": None,
-        "params": {}
-    }
+    if not node:
+        raise ValueError("selector_result is missing 'selected_node'.")
+    if not processed_dir:
+        raise ValueError("selector_result is missing 'processed_dir' (choose an output directory in the UI).")
 
-    def build_paths(node, folders):
-        mainDir = os.path.join(local_base_path, node)
-        wavs = [os.path.join(mainDir, f, audioFile) for f in folders]
-        jsns = [os.path.join(mainDir, f, dataFile) for f in folders]
-        return mainDir, wavs, jsns
+    os.makedirs(processed_dir, exist_ok=True)
 
-    def list_date_folders(node):
-        mainDir = os.path.join(local_base_path, node)
-        dateFolders = os.listdir(mainDir)
-        dateFolders.sort()
-        dateFolders = [d for d in dateFolders if "." not in d]
-        return mainDir, dateFolders
+    if csv_filename is None:
+        csv_filename = f"{node}_wav_rms.csv"
 
-    # ---------- GUI ----------
-    root = tk.Tk()
-    root.title(title)
-    root.geometry("900x520")
-    root.attributes("-topmost", True)
+    csv_path = os.path.join(processed_dir, csv_filename)
 
-    # ---------- Parameter bar ----------
-    param_frame = ttk.LabelFrame(root, text="Processing Parameters")
-    param_frame.pack(fill="x", padx=12, pady=(10, 6))
+    rows = []
+    for i, wav_path in enumerate(wav_paths):
+        folder = folders[i] if i < len(folders) else ""
 
-    def make_entry(label, default, col):
-        ttk.Label(param_frame, text=label).grid(row=0, column=col*2, padx=6, pady=6)
-        var = tk.StringVar(value=str(default))
-        ent = ttk.Entry(param_frame, textvariable=var, width=8)
-        ent.grid(row=0, column=col*2+1, padx=6, pady=6)
-        return var
+        if not os.path.isfile(wav_path):
+            rows.append(
+                {
+                    "node": node,
+                    "folder": folder,
+                    "wav_path": wav_path,
+                    "rms": "",
+                    "error": "missing_file",
+                }
+            )
+            continue
 
-    f0_low_var  = make_entry("f0 low (Hz)", 100, 0)
-    f0_high_var = make_entry("f0 high (Hz)", 200, 1)
-    low_cut_var = make_entry("low_cut (Hz)", 200, 2)
-    mid_cut_var = make_entry("mid_cut (Hz)", 500, 3)
-    high_cut_var= make_entry("high_cut (Hz)", 1000, 4)
-
-    # ---------- Main panels ----------
-    split = ttk.Frame(root)
-    split.pack(fill="both", expand=True, padx=12, pady=8)
-
-    split.columnconfigure(0, weight=1)
-    split.columnconfigure(1, weight=2)
-    split.rowconfigure(0, weight=1)
-
-    # Left panel — Nodes
-    nodes_panel = ttk.Labelframe(split, text="Nodes")
-    nodes_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-    nodes_panel.rowconfigure(0, weight=1)
-    nodes_panel.columnconfigure(0, weight=1)
-
-    node_listbox = tk.Listbox(nodes_panel, selectmode="browse")
-    node_listbox.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
-
-    # Right panel — Folders
-    folders_panel = ttk.Labelframe(split, text="Folders (multi-select)")
-    folders_panel.grid(row=0, column=1, sticky="nsew")
-    folders_panel.rowconfigure(0, weight=1)
-    folders_panel.columnconfigure(0, weight=1)
-
-    folder_listbox = tk.Listbox(folders_panel, selectmode="extended")
-    folder_listbox.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
-
-    # ---------- Buttons ----------
-    btn_row = ttk.Frame(root)
-    btn_row.pack(fill="x", padx=12, pady=(0, 12))
-
-    def select_all():
-        folder_listbox.select_set(0, tk.END)
-
-    def clear_sel():
-        folder_listbox.selection_clear(0, tk.END)
-
-    ttk.Button(btn_row, text="Select All Folders", command=select_all).pack(side="left")
-    ttk.Button(btn_row, text="Clear Folder Selection", command=clear_sel).pack(side="left", padx=8)
-
-    # ---------- Behavior ----------
-    current_node = {"value": None}
-
-    def fill_nodes():
-        for n in local_node_list:
-            node_listbox.insert(tk.END, n)
-
-    def on_node_select(evt=None):
-        sel = node_listbox.curselection()
-        if not sel:
-            return
-        node = local_node_list[sel[0]]
-        current_node["value"] = node
-
-        mainDir, folders = list_date_folders(node)
-        folder_listbox.delete(0, tk.END)
-        for f in folders:
-            folder_listbox.insert(tk.END, f)
-
-    def validate_float(val, name):
         try:
-            return float(val)
-        except ValueError:
-            messagebox.showerror("Invalid number", f"{name} must be a number.")
+            with wave.open(wav_path, "rb") as wf:
+                n_channels = wf.getnchannels()
+                sampwidth = wf.getsampwidth()
+                framerate = wf.getframerate()
+                n_frames = wf.getnframes()
+            duration_sec = (n_frames / framerate) if framerate else 0.0
+
+            rms = _wav_total_rms(wav_path)
+
+            #TODO: f0, f1,... ratios of energy
+
+
+            rows.append(
+                {
+                    "node": node,
+                    "folder": folder,
+                    "wav_path": wav_path,
+                    "rms": rms,
+                    "n_channels": n_channels,
+                    "sampwidth_bytes": sampwidth,
+                    "framerate_hz": framerate,
+                    "n_frames": n_frames,
+                    "duration_sec": duration_sec,
+                    "error": "",
+                }
+            )
+        except Exception as e:
+            rows.append(
+                {
+                    "node": node,
+                    "folder": folder,
+                    "wav_path": wav_path,
+                    "rms": "",
+                    "error": str(e),
+                }
+            )
+
+    fieldnames = [
+        "node",
+        "folder",
+        "wav_path",
+        "rms",
+        "n_channels",
+        "sampwidth_bytes",
+        "framerate_hz",
+        "n_frames",
+        "duration_sec",
+        "error",
+    ]
+
+    with open(csv_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+
+    return csv_path
+
+
+# ---------------- Threaded worker for UI responsiveness ----------------
+class RmsWorker(QThread):
+    log = pyqtSignal(str)
+    progress = pyqtSignal(int, int)  # done, total
+    finished_ok = pyqtSignal(str)    # csv_path
+    failed = pyqtSignal(str)
+
+    def __init__(self, selector_result: dict):
+        super().__init__()
+        self.selector_result = selector_result
+
+    def run(self):
+        try:
+            wav_paths = self.selector_result.get("dateWavPaths") or []
+            total = len(wav_paths)
+            if total == 0:
+                raise ValueError("No WAV paths found (did you select folders with audio.wav?)")
+
+            # We'll compute and write ourselves so we can emit progress.
+            node = self.selector_result.get("selected_node")
+            folders = self.selector_result.get("selected_folders") or []
+            processed_dir = self.selector_result.get("processed_dir")
+            if not node or not processed_dir:
+                raise ValueError("Missing selected_node or processed_dir.")
+
+            os.makedirs(processed_dir, exist_ok=True)
+            csv_path = os.path.join(processed_dir, f"{node}_wav_rms.csv")
+
+            fieldnames = [
+                "node",
+                "folder",
+                "wav_path",
+                "rms",
+                "n_channels",
+                "sampwidth_bytes",
+                "framerate_hz",
+                "n_frames",
+                "duration_sec",
+                "error",
+            ]
+
+            self.log.emit(f"Writing CSV: {csv_path}")
+            done = 0
+
+            with open(csv_path, "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=fieldnames)
+                w.writeheader()
+
+                for i, wav_path in enumerate(wav_paths):
+                    folder = folders[i] if i < len(folders) else ""
+
+                    if not os.path.isfile(wav_path):
+                        w.writerow(
+                            {
+                                "node": node,
+                                "folder": folder,
+                                "wav_path": wav_path,
+                                "rms": "",
+                                "n_channels": "",
+                                "sampwidth_bytes": "",
+                                "framerate_hz": "",
+                                "n_frames": "",
+                                "duration_sec": "",
+                                "error": "missing_file",
+                            }
+                        )
+                        done += 1
+                        self.progress.emit(done, total)
+                        continue
+
+                    try:
+                        with wave.open(wav_path, "rb") as wf:
+                            n_channels = wf.getnchannels()
+                            sampwidth = wf.getsampwidth()
+                            framerate = wf.getframerate()
+                            n_frames = wf.getnframes()
+                        duration_sec = (n_frames / framerate) if framerate else 0.0
+
+                        rms = _wav_total_rms(wav_path)
+
+                        w.writerow(
+                            {
+                                "node": node,
+                                "folder": folder,
+                                "wav_path": wav_path,
+                                "rms": rms,
+                                "n_channels": n_channels,
+                                "sampwidth_bytes": sampwidth,
+                                "framerate_hz": framerate,
+                                "n_frames": n_frames,
+                                "duration_sec": duration_sec,
+                                "error": "",
+                            }
+                        )
+                    except Exception as e:
+                        w.writerow(
+                            {
+                                "node": node,
+                                "folder": folder,
+                                "wav_path": wav_path,
+                                "rms": "",
+                                "n_channels": "",
+                                "sampwidth_bytes": "",
+                                "framerate_hz": "",
+                                "n_frames": "",
+                                "duration_sec": "",
+                                "error": str(e),
+                            }
+                        )
+
+                    done += 1
+                    if done % 10 == 0 or done == total:
+                        self.log.emit(f"Processed {done}/{total}")
+                    self.progress.emit(done, total)
+
+            self.finished_ok.emit(csv_path)
+
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+# ---------------- Main UI ----------------
+class MainWindow(QMainWindow):
+    def __init__(self, local_base_path: str):
+        super().__init__()
+        self.setWindowTitle("Ocellus apis audio processing")
+        self.resize(1180, 640)
+
+        self.audioFile = "audio.wav"
+        self.dataFile = "data.json"
+
+        self.local_base_path = local_base_path
+        self.local_node_list = self._find_nodes(local_base_path)
+
+        self.selected_node: Optional[str] = None
+        self.current_folders: List[str] = []
+
+        self.worker: Optional[RmsWorker] = None
+
+        root = QWidget()
+        self.setCentralWidget(root)
+        layout = QVBoxLayout(root)
+
+        # --- Split panes ---
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # Nodes
+        nodes_group = QGroupBox("Nodes")
+        nodes_layout = QVBoxLayout(nodes_group)
+        self.nodes_list = QListWidget()
+        self.nodes_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        for n in self.local_node_list:
+            self.nodes_list.addItem(QListWidgetItem(n))
+        self.nodes_list.currentItemChanged.connect(self.on_node_changed)
+        nodes_layout.addWidget(self.nodes_list)
+
+        # Folders
+        folders_group = QGroupBox("Folders (multi-select)")
+        folders_layout = QVBoxLayout(folders_group)
+        self.folders_list = QListWidget()
+        self.folders_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        folders_layout.addWidget(self.folders_list)
+
+        btn_row = QWidget()
+        btn_l = QHBoxLayout(btn_row)
+        btn_l.setContentsMargins(0, 0, 0, 0)
+        self.btn_select_all = QPushButton("Select All")
+        self.btn_clear = QPushButton("Clear")
+        self.btn_select_all.clicked.connect(self.select_all_folders)
+        self.btn_clear.clicked.connect(self.clear_folder_selection)
+        btn_l.addWidget(self.btn_select_all)
+        btn_l.addWidget(self.btn_clear)
+        btn_l.addStretch(1)
+        folders_layout.addWidget(btn_row)
+
+        splitter.addWidget(nodes_group)
+        splitter.addWidget(folders_group)
+        splitter.setSizes([300, 600])
+        layout.addWidget(splitter, 1)
+
+        # --- Directories ---
+        # --- Directories (stacked, full width) ---
+        dirs_group = QGroupBox("Directories")
+        dirs_layout = QVBoxLayout(dirs_group)
+
+        self.base_dir_edit = QLineEdit(self.local_base_path)
+        self.processed_dir_edit = QLineEdit(os.path.join(self.local_base_path, "processed"))
+
+        base_browse = QPushButton("Browse…")
+        out_browse = QPushButton("Browse…")
+        base_browse.clicked.connect(self.browse_base_dir)
+        out_browse.clicked.connect(self.browse_processed_dir)
+
+        # Row 1: Base dir (full width)
+        base_row = QWidget()
+        base_row_l = QHBoxLayout(base_row)
+        base_row_l.setContentsMargins(0, 0, 0, 0)
+        base_row_l.addWidget(QLabel("Main directory to nodes:"))
+        base_row_l.addWidget(self.base_dir_edit, 1)  # <-- expand
+        base_row_l.addWidget(base_browse)  # <-- fixed
+        dirs_layout.addWidget(base_row)
+
+        # Row 2: Output dir (full width)
+        out_row = QWidget()
+        out_row_l = QHBoxLayout(out_row)
+        out_row_l.setContentsMargins(0, 0, 0, 0)
+        out_row_l.addWidget(QLabel("Processed files output directory:"))
+        out_row_l.addWidget(self.processed_dir_edit, 1)  # <-- expand
+        out_row_l.addWidget(out_browse)  # <-- fixed
+        dirs_layout.addWidget(out_row)
+
+        layout.addWidget(dirs_group)
+
+        # --- Params bar ---
+        params_group = QGroupBox("Processing Parameters")
+        params_form = QFormLayout(params_group)
+
+        validator = QDoubleValidator(0.0, 1e9, 6)
+
+        self.f0_low = QLineEdit("100")
+        self.f0_high = QLineEdit("200")
+        self.low_cut = QLineEdit("200")
+        self.mid_cut = QLineEdit("500")
+        self.high_cut = QLineEdit("1000")
+
+        for w in (self.f0_low, self.f0_high, self.low_cut, self.mid_cut, self.high_cut):
+            w.setValidator(validator)
+
+        row = QWidget()
+        row_l = QHBoxLayout(row)
+        row_l.setContentsMargins(0, 0, 0, 0)
+
+        def labeled(widget: QLineEdit, label: str):
+            box = QWidget()
+            bl = QHBoxLayout(box)
+            bl.setContentsMargins(0, 0, 0, 0)
+            bl.addWidget(QLabel(label))
+            bl.addWidget(widget)
+            return box
+
+        row_l.addWidget(labeled(self.f0_low, "f0 low (Hz)"))
+        row_l.addWidget(labeled(self.f0_high, "f0 high (Hz)"))
+        row_l.addWidget(labeled(self.low_cut, "low_cut (Hz)"))
+        row_l.addWidget(labeled(self.mid_cut, "mid_cut (Hz)"))
+        row_l.addWidget(labeled(self.high_cut, "high_cut (Hz)"))
+
+        params_form.addRow(row)
+        layout.addWidget(params_group)
+
+        # --- Run/Progress/Log ---
+        run_row = QWidget()
+        run_l = QHBoxLayout(run_row)
+        run_l.setContentsMargins(0, 0, 0, 0)
+
+        self.run_btn = QPushButton("Run RMS → CSV")
+        self.run_btn.clicked.connect(self.run_rms)
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+
+        run_l.addWidget(self.run_btn)
+        run_l.addWidget(self.progress, 1)
+
+        layout.addWidget(run_row)
+
+        self.log = QTextEdit()
+        self.log.setReadOnly(True)
+        layout.addWidget(self.log, 1)
+
+        # Preselect first node if present
+        if self.local_node_list:
+            self.nodes_list.setCurrentRow(0)
+
+    def _find_nodes(self, base_path: str) -> List[str]:
+        try:
+            nodes = os.listdir(base_path)
+            nodes = [n for n in nodes if not n.startswith(".")]
+            nodes.sort()
+            return nodes
+        except Exception:
+            return []
+
+    def append_log(self, msg: str):
+        self.log.append(msg)
+
+    def browse_base_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "Node directory", self.base_dir_edit.text() or "")
+        if d:
+            self.base_dir_edit.setText(d)
+            # refresh nodes
+            self.local_base_path = d
+            self.local_node_list = self._find_nodes(d)
+            self.nodes_list.clear()
+            for n in self.local_node_list:
+                self.nodes_list.addItem(QListWidgetItem(n))
+            self.folders_list.clear()
+            self.selected_node = None
+            if self.local_node_list:
+                self.nodes_list.setCurrentRow(0)
+
+    def browse_processed_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "Save directory", self.processed_dir_edit.text() or "")
+        if d:
+            self.processed_dir_edit.setText(d)
+
+    def on_node_changed(self, current: QListWidgetItem, previous: QListWidgetItem):
+        if current is None:
+            return
+        node = current.text()
+        self.selected_node = node
+        self.refresh_folders()
+
+    def refresh_folders(self):
+        base_dir = self.base_dir_edit.text().strip()
+        node = self.selected_node
+        self.folders_list.clear()
+        self.current_folders = []
+
+        if not node or not base_dir:
+            return
+
+        mainDir = os.path.join(base_dir, node)
+        try:
+            folders = os.listdir(mainDir)
+            folders.sort()
+            folders = [d for d in folders if "." not in d]
+        except Exception as e:
+            QMessageBox.critical(self, "Folder error", f"Could not list folders for node:\n{e}")
+            return
+
+        self.current_folders = folders
+        for f in folders:
+            self.folders_list.addItem(QListWidgetItem(f))
+
+    def select_all_folders(self):
+        for i in range(self.folders_list.count()):
+            self.folders_list.item(i).setSelected(True)
+
+    def clear_folder_selection(self):
+        self.folders_list.clearSelection()
+
+    def _read_params(self) -> Optional[Dict[str, float]]:
+        def get_float(widget: QLineEdit, name: str) -> Optional[float]:
+            t = widget.text().strip()
+            try:
+                return float(t)
+            except ValueError:
+                QMessageBox.critical(self, "Invalid number", f"{name} must be a number.")
+                return None
+
+        params = {
+            "f0_low": get_float(self.f0_low, "f0 low"),
+            "f0_high": get_float(self.f0_high, "f0 high"),
+            "low_cut": get_float(self.low_cut, "low_cut"),
+            "mid_cut": get_float(self.mid_cut, "mid_cut"),
+            "high_cut": get_float(self.high_cut, "high_cut"),
+        }
+        if any(v is None for v in params.values()):
+            return None
+        return params  # type: ignore
+
+    def _build_selector_result(self) -> Optional[Dict[str, Any]]:
+        node = self.selected_node
+        if not node:
+            QMessageBox.information(self, "Missing selection", "Please select a node.")
             return None
 
-    def finish():
-        node = current_node["value"]
-        if node is None:
-            messagebox.showinfo("Missing selection", "Please select a node.")
-            return
+        selected_items = self.folders_list.selectedItems()
+        if not selected_items:
+            QMessageBox.information(self, "Missing selection", "Please select at least one folder.")
+            return None
 
-        idxs = folder_listbox.curselection()
-        if not idxs:
-            messagebox.showinfo("Missing selection", "Please select at least one folder.")
-            return
+        base_dir = self.base_dir_edit.text().strip()
+        processed_dir = self.processed_dir_edit.text().strip()
+        if not base_dir:
+            QMessageBox.information(self, "Missing directory", "Please provide the main directory to nodes.")
+            return None
+        if not processed_dir:
+            QMessageBox.information(self, "Missing directory", "Please provide a directory to save processed files.")
+            return None
 
-        folders = [folder_listbox.get(i) for i in idxs]
+        params = self._read_params()
+        if params is None:
+            return None
 
-        # Validate parameters
-        params = {
-            "f0_low":  validate_float(f0_low_var.get(), "f0 low"),
-            "f0_high": validate_float(f0_high_var.get(), "f0 high"),
-            "low_cut": validate_float(low_cut_var.get(), "low_cut"),
-            "mid_cut": validate_float(mid_cut_var.get(), "mid_cut"),
-            "high_cut":validate_float(high_cut_var.get(), "high_cut"),
+        folders = [it.text() for it in selected_items]
+        mainDir = os.path.join(base_dir, node)
+        wavs = [os.path.join(mainDir, f, self.audioFile) for f in folders]
+        jsns = [os.path.join(mainDir, f, self.dataFile) for f in folders]
+
+        return {
+            "selected_node": node,
+            "selected_folders": folders,
+            "dateWavPaths": wavs,
+            "dateJsonPaths": jsns,
+            "mainDir": mainDir,
+            "params": params,
+            "base_dir": base_dir,
+            "processed_dir": processed_dir,
         }
 
-        if any(v is None for v in params.values()):
+    def run_rms(self):
+        if self.worker is not None and self.worker.isRunning():
+            QMessageBox.information(self, "Busy", "A run is already in progress.")
             return
 
-        mainDir, wavs, jsns = build_paths(node, folders)
+        selector_result = self._build_selector_result()
+        if selector_result is None:
+            return
 
-        out["selected_node"] = node
-        out["selected_folders"] = folders
-        out["mainDir"] = mainDir
-        out["dateWavPaths"] = wavs
-        out["dateJsonPaths"] = jsns
-        out["params"] = params
+        self.append_log("Starting RMS computation…")
+        self.progress.setValue(0)
+        self.run_btn.setEnabled(False)
 
-        root.quit()
+        self.worker = RmsWorker(selector_result)
+        self.worker.log.connect(self.append_log)
+        self.worker.progress.connect(self.on_progress)
+        self.worker.finished_ok.connect(self.on_finished_ok)
+        self.worker.failed.connect(self.on_failed)
+        self.worker.start()
 
-    ttk.Button(btn_row, text="Finish", command=finish).pack(side="right")
-    ttk.Button(btn_row, text="Cancel", command=root.quit).pack(side="right", padx=8)
+    def on_progress(self, done: int, total: int):
+        if total <= 0:
+            self.progress.setValue(0)
+            return
+        pct = int(100 * done / total)
+        self.progress.setValue(pct)
 
-    # Bindings
-    node_listbox.bind("<<ListboxSelect>>", on_node_select)
+    def on_finished_ok(self, csv_path: str):
+        self.append_log(f"Done. CSV written to: {csv_path}")
+        self.run_btn.setEnabled(True)
+        QMessageBox.information(self, "Finished", f"WAV RMS CSV written to:\n{csv_path}")
 
-    fill_nodes()
-
-    root.mainloop()
-    root.destroy()
-
-    return out
+    def on_failed(self, err: str):
+        self.append_log(f"ERROR: {err}")
+        self.run_btn.setEnabled(True)
+        QMessageBox.critical(self, "Error", err)
 
 
-# ------------------ usage ------------------
-import datetime
-local_base_path = "/Volumes/Case_portable/ocellus/hives_acs/"   # path to local drive containing data
-today = datetime.date.today()                                   # get today's datetime
-today_str2 = datetime.datetime.strftime(today, '%Y%m%d') # format datetime [year, month, day]
+def main():
+    local_base_path = "/Volumes/Case_portable/ocellus/hives_acs/"
+    app = QApplication(sys.argv)
+    w = MainWindow(local_base_path=local_base_path)
+    w.show()
+    sys.exit(app.exec())
 
-# Find local nodes
-print('Checking local nodes...')
-local_node_list = os.listdir(local_base_path)
-local_node_list = [node for node in local_node_list if not node.startswith('.')]
 
-result = node_folder_two_panel_selector(local_node_list, local_base_path)
-selected_node = result["selected_node"]
-dateFolders = result["selected_folders"]
-dateWavPaths = result["dateWavPaths"]
-dateJsonPaths = result["dateJsonPaths"]
-print(selected_node, len(dateFolders))
-
-#TODO add in actual processing, export to hdf5 file, gui to read in hdf5 file and export results
+if __name__ == "__main__":
+    main()
