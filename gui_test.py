@@ -1,18 +1,3 @@
-# pyqt6_node_folder_rms_gui.py
-# PyQt6 conversion of your Tkinter UI + RMS-to-CSV pipeline.
-#
-# Requires: PyQt6
-#
-# Usage:
-#   python pyqt6_node_folder_rms_gui.py
-#
-# Notes:
-# - Left panel: Nodes (single-select)
-# - Right panel: Folders (multi-select)
-# - Bottom: base dir + processed dir with Browse...
-# - Top: numeric parameter entries (defaults as requested)
-# - "Run RMS -> CSV" computes total RMS per WAV and writes CSV to processed_dir
-
 import os
 import csv
 import wave
@@ -88,43 +73,24 @@ def _wav_total_rms(wav_path: str, chunk_frames: int = 65536) -> float:
 
         return math.sqrt(sumsq / count)
 
-# def _psd(wav_path: str):
-#     fs, y = wavfile.read(wav_path)  # read in audio file
-#     y = y - np.mean(y)  # remove DC offset
-#     dt = 1 / fs
-#     timeSeries1 = np.array(timeSeries1)
-#     N = np.size(timeSeries1)
-#     T = N * dt
-#     nFFT = 2 ** int(np.ceil(np.log2(N)))
-#     freqs = np.arange(0, nFFT / 2)
-#
-#     if window == 'rectangular':
-#         w = np.ones(nFFT)
-#     elif window == 'hann':
-#         w = np.hanning(nFFT)
-#     elif window == 'flattop':
-#         w = sp.signal.windows.flattop(nFFT)
-#     elif window == 'hamming':
-#         w = np.hamming(nFFT)
-#     else:
-#         raise ValueError("No window function defined.")
-#
-#     GxyTemp = []
-#     for wIndex in np.arange(0, nWins):
-#         # print(f'Processing {wIndex} of {nWins}')
-#         advInx = wIndex * nAdv
-#         sig1 = timeSeries1[advInx:nFFT + advInx] * w / np.mean(w ** 2)  # may need a ,0 in the indexing for ice2024 data
-#         sig2 = timeSeries2[advInx:nFFT + advInx] * w / np.mean(w ** 2)
-#         lnspc1 = np.fft.fft(sig1, axis=0) * dt
-#         if type == 'gxx':
-#             lnspc2 = lnspc1
-#         elif type == 'gxy':
-#             lnspc2 = np.fft.fft(sig2, axis=0) * dt
-#         GxyTemp.append(2 / T_win * np.conjugate(lnspc1[0:int(nFFT / 2)]) * lnspc2[0:int(nFFT / 2)])
-#     Gxy_avg = np.sum(GxyTemp, axis=0) / nWins
-#     Gxy_mtx = np.rot90(GxyTemp)
-#     return_dict = {'Gxy_avg': Gxy_avg, 'Gxy_mtx': Gxy_mtx, 'freqs': freqs, 'times_spec': times_spec, 'df_win': df_win}
-#     return return_dict
+def psd(wav_path: str):
+    fs, y = wavfile.read(wav_path)  # read in audio file
+    y = y[0]
+    y = y - np.mean(y)  # remove DC offset
+    dt = 1 / fs
+    timeSeries1 = np.array(y)
+    N = np.size(timeSeries1)
+    T = N * dt
+    # nFFT = 2 ** int(np.ceil(np.log2(N)))
+    nFFT = N
+    freqs = np.arange(0, nFFT / 2)
+    lnspc1 = np.fft.fft(y, axis=0) * dt
+    Gxy_avg = 2 / T * np.conjugate(lnspc1[0:int(nFFT / 2)]) * lnspc1[0:int(nFFT / 2)]
+    return Gxy_avg, freqs
+
+def peak_f_range(Gxy_avg, freqs, f_low, f_high):
+    peak_f_range = np.where(Gxy_avg == np.max(Gxy_avg))[0][0]
+    return freqs[peak_f_range]
 
 
 def process_selected_node_rms_to_csv(selector_result: dict, csv_filename: Optional[str] = None) -> str:
@@ -658,7 +624,7 @@ class MainWindow(QMainWindow):
     def on_finished_ok(self, csv_path: str):
         self.append_log(f"Done. CSV written to: {csv_path}")
         self.run_btn.setEnabled(True)
-        QMessageBox.information(self, "Finished", f"WAV RMS CSV written to:\n{csv_path}")
+        QMessageBox.information(self, "Finished", f"CSV written to:\n{csv_path}")
 
     def on_failed(self, err: str):
         self.append_log(f"ERROR: {err}")
